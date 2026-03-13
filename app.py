@@ -1,9 +1,8 @@
 import os
-from typing import Literal
 
 import streamlit as st
 from dotenv import load_dotenv
-import PyPDF2
+import fitz  # PyMuPDF
 import docx
 
 
@@ -129,19 +128,21 @@ def _extract_text_from_file(uploaded_file) -> str:
         return read_text_like()
 
     if suffix == "pdf":
-        reader = PyPDF2.PdfReader(uploaded_file)
+        # 使用 PyMuPDF 读取 PDF 内容
+        data = uploaded_file.read()
+        doc = fitz.open(stream=data, filetype="pdf")
         texts = []
-        for page in reader.pages:
+        for page in doc:
             try:
-                texts.append(page.extract_text() or "")
+                texts.append(page.get_text() or "")
             except Exception:
                 continue
         return "\n\n".join(texts)
 
     if suffix == "docx":
         # 注意：docx.Document 需要一个二进制文件对象
-        doc = docx.Document(uploaded_file)
-        return "\n\n".join(p.text for p in doc.paragraphs)
+        doc_obj = docx.Document(uploaded_file)
+        return "\n\n".join(p.text for p in doc_obj.paragraphs)
 
     raise ValueError(f"暂不支持的文件格式：{suffix}")
 
@@ -334,4 +335,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
