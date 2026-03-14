@@ -1,8 +1,19 @@
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import chromadb
+import jieba
 from openai import OpenAI
+from rank_bm25 import BM25Okapi
+from FlagEmbedding import FlagReranker
+
+
+# RAG 问答使用的 System Prompt 常量
+SYSTEM_PROMPT = (
+    "你是一个专业的交易知识助手，擅长解释 ICT、SMC 等交易理论。"
+    "请严格基于用户提供的参考资料回答问题；若参考资料中无相关信息，请明确说明。"
+    "回答应简洁、准确、有条理。"
+)
 
 
 class RAGEngine:
@@ -26,8 +37,14 @@ class RAGEngine:
             base_url="https://api.deepseek.com",
         )
 
-        # 2. 初始化 ChromaDB（使用内存或默认配置）
-        self.chroma_client = chromadb.Client()
+        # 2. 初始化 ChromaDB（使用本地持久化存储，避免默认的远程 tenant 配置）
+        # 持久化目录放在项目的 data/chroma 文件夹下
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        persist_dir = os.path.join(base_dir, "data", "chroma")
+        os.makedirs(persist_dir, exist_ok=True)
+
+        # 使用 PersistentClient，而不是默认的 Client（默认现在会尝试连远程 tenant）
+        self.chroma_client = chromadb.PersistentClient(path=persist_dir)
         self.collection_name = collection_name
 
         # 尝试获取已存在的集合，如果不存在则创建新的
@@ -35,6 +52,17 @@ class RAGEngine:
             self.collection = self.chroma_client.get_collection(name=collection_name)
         except Exception:
             self.collection = self.chroma_client.create_collection(name=collection_name)
+
+        # 3. 初始化 BM25 相关结构（只在内存中，不持久化）
+        self._bm25_corpus: List[str] = []          # 原始文档文本列表
+        self._bm25_metadatas: List[Dict] = []      # 与 corpus 对齐的元数据列表
+        self._bm25_tokenized: List[List[str]] = [] # 分词后的文档
+        self._bm25_model: Optional[BM25Okapi] = None
+
+        # 4. 重排模型（FlagEmbedding）懒加载句柄
+        self._reranker: Optional[FlagReranker] = None
+
+    # ==================== 公共接口 ====================
 
     def add_documents(self, documents: List[str], metadatas: Optional[List[Dict]] = None) -> int:
         """
@@ -63,6 +91,15 @@ class RAGEngine:
             metadatas=metadatas,
             ids=doc_ids,
         )
+
+        # 同步更新 BM25 语料和索引
+        self._bm25_corpus.extend(documents)
+        self._bm25_metadatas.extend(metadatas)
+        tokenized_new = [self._tokenize(text) for text in documents]
+        self._bm25_tokenized.extend(tokenized_new)
+
+        if self._bm25_tokenized:
+            self._bm25_model = BM25Okapi(self._bm25_tokenized)
 
         return len(documents)
 
@@ -147,7 +184,290 @@ class RAGEngine:
 
         return documents, metadatas
 
-    def ask(self, question: str, n_results: int = 3) -> Dict:
+    # ==================== 混合检索（向量 + BM25） ====================
+
+    def hybrid_search(
+        self,
+        query: str,
+        n_results: int = 3,
+        use_reranker: bool = False,
+        return_metadata: bool = False,
+    ) -> Union[Tuple[List[str], List[Dict], Dict], Dict[str, Any]]:
+        """
+        混合检索接口：向量检索 + BM25 检索，使用 RRF 进行结果融合。
+
+        Args:
+            query: 查询问题。
+            n_results: 返回结果数量（top_k）。
+            use_reranker: 是否使用重排模型对融合结果精排。
+            return_metadata: 是否返回检索元数据（search_type、reranker_used、total_candidates 等）。
+
+        Returns:
+            - 当 return_metadata=False：(fused_docs, fused_metas, debug_info)，与原有行为一致。
+            - 当 return_metadata=True：{
+                "results": [{"doc": ..., "meta": ..., "score": ... or None}, ...],
+                "metadata": {
+                    "search_type": "hybrid" | "vector",
+                    "reranker_used": bool,
+                    "total_candidates": int,
+                    "final_count": int,
+                    "avg_score": float | None,
+                    "max_score": float | None,
+                },
+                "debug_info": debug_info,
+              }
+        """
+        debug_info: Dict[str, List] = {"vector": [], "bm25": [], "fused": [], "rerank": []}
+        total_candidates = 0
+        search_type = "vector"
+        reranker_used = False
+        rerank_items: List[Dict] = []
+
+        # 如果 BM25 尚未构建，则退化为纯向量检索
+        if not self._bm25_model or not self._bm25_corpus:
+            docs, metas = self.search(query, n_results)
+            total_candidates = len(docs)
+            debug_info["vector"] = [{"doc": d, "meta": m} for d, m in zip(docs, metas)]
+            debug_info["fused"] = debug_info["vector"]
+            fused_docs, fused_metas = docs, metas
+        else:
+            search_type = "hybrid"
+            vector_docs, vector_metas = self._vector_search(query, n_results * 3)
+            bm25_docs, bm25_metas = self._bm25_search(query, n_results * 3)
+            total_candidates = len(vector_docs) + len(bm25_docs)
+
+            fused_docs, fused_metas = self._rrf_fusion(
+                list(zip(vector_docs, vector_metas)),
+                list(zip(bm25_docs, bm25_metas)),
+                n_results=n_results,
+            )
+
+            debug_info["vector"] = [{"doc": d, "meta": m} for d, m in zip(vector_docs, vector_metas)]
+            debug_info["bm25"] = [{"doc": d, "meta": m} for d, m in zip(bm25_docs, bm25_metas)]
+            debug_info["fused"] = [{"doc": d, "meta": m} for d, m in zip(fused_docs, fused_metas)]
+
+            # 可选：使用重排模型对融合结果做二次排序
+            if use_reranker:
+                fused_docs, fused_metas, rerank_items = self._rerank(
+                    query, fused_docs, fused_metas
+                )
+                debug_info["rerank"] = rerank_items
+                reranker_used = len(rerank_items) > 0
+
+        # 构建统一 results 列表：每项为 {"doc", "meta", "score"}
+        if rerank_items:
+            results = [
+                {"doc": r["doc"], "meta": r["meta"], "score": r["score"]}
+                for r in rerank_items
+            ]
+        else:
+            results = [
+                {"doc": d, "meta": m, "score": None}
+                for d, m in zip(fused_docs, fused_metas)
+            ]
+
+        if return_metadata:
+            scores = [r["score"] for r in results if r["score"] is not None]
+            metadata: Dict[str, Any] = {
+                "search_type": search_type,
+                "reranker_used": reranker_used,
+                "total_candidates": total_candidates,
+                "final_count": len(results),
+                "avg_score": float(sum(scores)) / len(scores) if scores else None,
+                "max_score": max(scores) if scores else None,
+            }
+            return {
+                "results": results,
+                "metadata": metadata,
+                "debug_info": debug_info,
+            }
+
+        return fused_docs, fused_metas, debug_info
+
+    # ==================== 内部方法：BM25 & RRF ====================
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """
+        中英文混合分词：
+        - 先统一为小写
+        - 使用 jieba 做中文切分，同时对英文/数字片段也能较好处理
+        """
+        lowered = text.lower()
+        return [tok.strip() for tok in jieba.cut(lowered) if tok.strip()]
+
+    def _vector_search(self, query: str, n_results: int = 3) -> Tuple[List[str], List[Dict]]:
+        """
+        内部向量检索封装，便于与 BM25 结果做融合。
+        实际上调用的就是现有的 self.search。
+        """
+        return self.search(query, n_results)
+
+    def _bm25_search(self, query: str, n_results: int = 3) -> Tuple[List[str], List[Dict]]:
+        """
+        仅使用 BM25 的检索。
+        """
+        if not self._bm25_model or not self._bm25_corpus:
+            return [], []
+
+        query_tokens = self._tokenize(query)
+        scores = self._bm25_model.get_scores(query_tokens)
+
+        # 根据得分排序，取前 n_results 个索引
+        ranked_indices = sorted(
+            range(len(scores)),
+            key=lambda i: scores[i],
+            reverse=True,
+        )[:n_results]
+
+        docs = [self._bm25_corpus[i] for i in ranked_indices]
+        metas = [self._bm25_metadatas[i] for i in ranked_indices]
+        return docs, metas
+
+    def _load_reranker(self) -> Optional[FlagReranker]:
+        """
+        懒加载重排模型（FlagEmbedding）。
+        只在首次需要时加载，避免占用过多显存/内存。
+        """
+        if self._reranker is not None:
+            return self._reranker
+
+        try:
+            # 这里选择 BAAI/bge-reranker-base，你可以根据需要改成 large/m3 等
+            self._reranker = FlagReranker(
+                "BAAI/bge-reranker-base",
+                use_fp16=True,
+            )
+        except Exception:
+            # 加载失败则返回 None，上层逻辑会自动跳过重排
+            self._reranker = None
+
+        return self._reranker
+
+    def ensure_reranker_loaded(self) -> bool:
+        """
+        对外暴露的便捷方法：确保重排模型已加载。
+        返回 True 表示可用，False 表示加载失败或未安装依赖。
+        """
+        return self._load_reranker() is not None
+
+    def _rerank(
+        self,
+        query: str,
+        docs: List[str],
+        metas: List[Dict],
+    ) -> Tuple[List[str], List[Dict], List[Dict]]:
+        """
+        使用 FlagEmbedding 对候选文档进行重排。
+
+        Returns:
+            rerank_docs, rerank_metas, rerank_items
+            其中 rerank_items 中的每一项为:
+            {"doc": doc, "meta": meta, "score": score}
+        """
+        reranker = self._load_reranker()
+        if reranker is None or not docs:
+            return docs, metas, []
+
+        pairs = [[query, d] for d in docs]
+        try:
+            scores = reranker.compute_score(pairs)
+        except Exception:
+            return docs, metas, []
+
+        # 根据 score 从大到小排序
+        ranked_indices = sorted(
+            range(len(scores)),
+            key=lambda i: float(scores[i]),
+            reverse=True,
+        )
+
+        rerank_docs: List[str] = []
+        rerank_metas: List[Dict] = []
+        rerank_items: List[Dict] = []
+        for i in ranked_indices:
+            d = docs[i]
+            m = metas[i]
+            s = float(scores[i])
+            rerank_docs.append(d)
+            rerank_metas.append(m)
+            rerank_items.append({"doc": d, "meta": m, "score": s})
+
+        return rerank_docs, rerank_metas, rerank_items
+
+    @staticmethod
+    def _rrf_fusion(
+        vector_results: List[Tuple[str, Dict]],
+        bm25_results: List[Tuple[str, Dict]],
+        n_results: int = 3,
+        k: int = 60,
+    ) -> Tuple[List[str], List[Dict]]:
+        """
+        RRF（Reciprocal Rank Fusion）结果融合。
+
+        Args:
+            vector_results: [(doc, meta), ...]，按向量相似度排序。
+            bm25_results:   [(doc, meta), ...]，按 BM25 得分排序。
+            n_results: 返回数量。
+            k: RRF 参数，默认 60。
+        """
+        from json import dumps
+
+        def _key(doc: str, meta: Dict) -> str:
+            # 通过 文本 + 元数据 的 JSON 串作为 key，近似唯一标识一个 chunk
+            return dumps({"doc": doc, "meta": meta}, ensure_ascii=False, sort_keys=True)
+
+        scores: Dict[str, float] = {}
+        payloads: Dict[str, Tuple[str, Dict]] = {}
+
+        # 向量结果打分
+        for rank, (doc, meta) in enumerate(vector_results, start=1):
+            key = _key(doc, meta)
+            payloads[key] = (doc, meta)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+
+        # BM25 结果打分
+        for rank, (doc, meta) in enumerate(bm25_results, start=1):
+            key = _key(doc, meta)
+            payloads[key] = (doc, meta)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+
+        # 按融合分数排序取前 n 个
+        ranked_keys = sorted(scores.keys(), key=lambda kk: scores[kk], reverse=True)[:n_results]
+
+        docs: List[str] = []
+        metas: List[Dict] = []
+        for kk in ranked_keys:
+            doc, meta = payloads[kk]
+            docs.append(doc)
+            metas.append(meta)
+
+        return docs, metas
+
+    # ==================== Prompt 构建 ====================
+
+    @staticmethod
+    def _build_user_prompt(question: str, context: str) -> str:
+        """
+        根据用户问题和检索到的参考资料构建 User Prompt。
+
+        Args:
+            question: 用户问题。
+            context: 检索得到的文档片段拼接成的上下文（如用 "\\n\\n---\\n\\n" 分隔）。
+
+        Returns:
+            完整的 user 消息内容。
+        """
+        return (
+            "请基于以下参考资料回答用户的问题。\n\n"
+            "【参考资料】\n"
+            f"{context}\n\n"
+            "【用户问题】\n"
+            f"{question}\n\n"
+            "请基于参考资料给出准确、专业的回答。如果参考资料中没有相关信息，请明确说明。"
+        )
+
+    def ask(self, question: str, n_results: int = 3, use_reranker: bool = False) -> Dict:
         """
         RAG 问答 - 核心方法。
 
@@ -158,37 +478,31 @@ class RAGEngine:
         Returns:
             包含答案、检索结果等信息的字典。
         """
-        # 1. 检索相关文档
-        retrieved_docs, metadatas = self.search(question, n_results)
+        # 1. 检索相关文档（使用混合检索：向量 + BM25），并记录检索细节
+        retrieved_docs, metadatas, debug_info = self.hybrid_search(
+            question,
+            n_results,
+            use_reranker=use_reranker,
+        )
 
         if not retrieved_docs:
             return {
                 "answer": "抱歉，我的知识库中还没有相关信息。请先上传一些文档。",
                 "sources": [],
                 "retrieved_docs": [],
+                "debug": debug_info,
             }
 
-        # 2. 构建上下文
+        # 2. 构建上下文与 User Prompt
         context = "\n\n---\n\n".join(retrieved_docs)
+        user_prompt = self._build_user_prompt(question, context)
 
-        # 3. 构建 Prompt
-        prompt = (
-            "你是一个专业的交易知识助手。请基于以下参考资料回答用户的问题。\n\n"
-            "参考资料：\n"
-            f"{context}\n\n"
-            f"用户问题：{question}\n\n"
-            "请基于参考资料给出准确、专业的回答。如果参考资料中没有相关信息，请明确说明。"
-        )
-
-        # 4. 调用 LLM 生成答案
+        # 3. 调用 LLM 生成答案（使用 SYSTEM_PROMPT + _build_user_prompt）
         response = self.client.chat.completions.create(
             model="deepseek-chat",
             messages=[
-                {
-                    "role": "system",
-                    "content": "你是一个专业的交易知识助手，擅长解释 ICT、SMC 等交易理论。",
-                },
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
             ],
             temperature=0.7,
             max_tokens=1000,
@@ -196,11 +510,12 @@ class RAGEngine:
 
         answer = response.choices[0].message.content
 
-        # 5. 返回结果
+        # 4. 返回结果
         return {
             "answer": answer,
             "sources": metadatas,
             "retrieved_docs": retrieved_docs,
+            "debug": debug_info,
         }
 
     def get_collection_count(self) -> int:

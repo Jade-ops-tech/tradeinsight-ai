@@ -1,4 +1,7 @@
+import json
 import os
+import re
+from datetime import datetime
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -17,20 +20,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# 自定义 CSS 样式（目前留空，你可以在这里放全局样式）
+# 自定义 CSS 样式：检索分数颜色、复制按钮等
 st.markdown(
     """
     <style>
-    /* 这里可以写自定义 CSS，例如：
-    .main {
-        background-color: #0b1020;
-        color: #ffffff;
-    }
-    */
+    .score-high   { color: #22c55e; font-weight: 600; }  /* 绿色 >0.8 */
+    .score-mid    { color: #eab308; font-weight: 600; }   /* 黄色 0.6-0.8 */
+    .score-low    { color: #94a3b8; font-weight: 500; }   /* 灰色 <0.6 */
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+# 文档截断长度
+RETRIEVAL_SNIPPET_LEN = 200
+
+
+def highlight_keywords(text: str, query: str) -> str:
+    """在文档片段中高亮用户查询的关键词（Markdown 粗体）。"""
+    if not text or not query:
+        return text or ""
+    keywords = [kw for kw in query.split() if kw.strip()]
+    for kw in keywords:
+        pattern = re.compile(f"({re.escape(kw)})", re.IGNORECASE)
+        text = pattern.sub(r"**\1**", text)
+    return text
 
 
 # ==================== 初始化 ====================
@@ -44,6 +58,12 @@ def init_session_state() -> None:
 
     if "documents_loaded" not in st.session_state:
         st.session_state.documents_loaded = False
+
+    if "retrieval_history" not in st.session_state:
+        st.session_state.retrieval_history = []  # 每次查询的检索质量，用于趋势展示
+
+    if "last_retrieval_for_export" not in st.session_state:
+        st.session_state.last_retrieval_for_export = None  # 最近一次检索详情，用于导出报告
 
 
 def init_rag_engine() -> bool:
@@ -79,6 +99,15 @@ def render_sidebar() -> None:
 
         st.divider()
 
+        # 重排模型开关
+        st.subheader("🧠 高级设置")
+        st.checkbox(
+            "使用重排模型（FlagEmbedding）优化排序",
+            value=st.session_state.get("use_reranker", False),
+            key="use_reranker",
+            help="勾选后会在混合检索结果之上，再用 bge-reranker 做一次精排，效果更好但会更慢。",
+        )
+
         # 文件上传
         st.subheader("📤 上传文档")
         uploaded_file = st.file_uploader(
@@ -107,8 +136,169 @@ def render_sidebar() -> None:
                 st.session_state.rag_engine.clear_collection()
             st.session_state.chat_history = []
             st.session_state.documents_loaded = False
+            st.session_state.retrieval_history = []
             st.success("✅ 知识库已清空")
             st.experimental_rerun()
+
+        st.divider()
+
+        # 📈 检索历史对比
+        render_retrieval_history_trend()
+
+        st.divider()
+
+        # 📥 导出检索报告
+        st.subheader("📥 导出检索报告")
+        last = st.session_state.get("last_retrieval_for_export")
+        if last:
+            report_md = generate_report(last, "md")
+            report_json = generate_report(last, "json")
+            st.download_button(
+                label="下载 Markdown 报告",
+                data=report_md,
+                file_name=f"search_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                mime="text/markdown",
+            )
+            st.download_button(
+                label="下载 JSON 报告",
+                data=report_json,
+                file_name=f"search_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+            )
+        else:
+            st.caption("请先进行一次提问，即可导出最近一次检索详情。")
+
+
+def _record_retrieval_quality(
+    query: str,
+    result: dict,
+    reranker_used: bool,
+) -> None:
+    """记录本次查询的检索质量到 retrieval_history。"""
+    history = st.session_state.get("retrieval_history", [])
+    sources = result.get("sources") or []
+    final_count = len(sources)
+    rerank_list = (result.get("debug") or {}).get("rerank") or []
+    if rerank_list:
+        scores = [float(r.get("score") or 0) for r in rerank_list]
+        avg_score = sum(scores) / len(scores) if scores else None
+        max_score = max(scores) if scores else None
+    else:
+        avg_score = max_score = None
+
+    entry = {
+        "query": query,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "final_count": final_count,
+        "avg_score": avg_score,
+        "max_score": max_score,
+        "reranker_used": reranker_used,
+    }
+    history.append(entry)
+    # 只保留最近 50 条
+    st.session_state.retrieval_history = history[-50:]
+
+
+def generate_report(search_results: dict, fmt: str) -> str:
+    """
+    根据检索详情生成可导出的报告内容。
+    search_results 需包含: query, answer, ts, sources, retrieved_docs, debug(可选)
+    fmt: "md" | "json"
+    """
+    query = search_results.get("query", "")
+    answer = search_results.get("answer", "")
+    ts = search_results.get("ts", "")
+    sources = search_results.get("sources", [])
+    retrieved_docs = search_results.get("retrieved_docs", [])
+    debug = search_results.get("debug") or {}
+
+    if fmt == "json":
+        # 可序列化结构（避免非基本类型）
+        payload = {
+            "query": query,
+            "answer": answer,
+            "export_time": ts,
+            "num_sources": len(sources),
+            "sources": [
+                {**meta, "snippet": _truncate_doc(doc, RETRIEVAL_SNIPPET_LEN)}
+                for meta, doc in zip(sources, retrieved_docs)
+            ],
+            "debug": {
+                k: [
+                    {"doc": (x.get("doc") or "")[:500], "meta": x.get("meta"), "score": x.get("score")}
+                    for x in (v or [])
+                ]
+                for k, v in debug.items()
+                if isinstance(v, list)
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    # Markdown
+    lines = [
+        "# 检索报告",
+        "",
+        f"**导出时间**：{ts}",
+        "",
+        "## 用户问题",
+        "",
+        query,
+        "",
+        "## 答案",
+        "",
+        answer,
+        "",
+        "## 检索统计",
+        "",
+        f"- 命中片段数：{len(sources)}",
+        "",
+        "## 引用片段",
+        "",
+    ]
+    for i, (meta, doc) in enumerate(zip(sources, retrieved_docs), 1):
+        src = meta.get("source", "未知")
+        chunk_id = meta.get("chunk_id", "")
+        snippet = _truncate_doc(doc, RETRIEVAL_SNIPPET_LEN)
+        lines.append(f"### {i}. {src} (chunk {chunk_id})")
+        lines.append("")
+        lines.append(snippet)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_retrieval_history_trend() -> None:
+    """展示检索历史对比与趋势（表格 + 折线图）。"""
+    history = st.session_state.get("retrieval_history", [])
+    if not history:
+        st.subheader("📈 检索历史对比")
+        st.caption("暂无记录，提问后将在此展示每次检索质量与趋势。")
+        return
+
+    st.subheader("📈 检索历史对比")
+    # 表格：时间、问题(截断)、命中数、平均相关性、最高相关性、重排
+    max_query_len = 20
+    rows = []
+    for i, e in enumerate(history):
+        q = (e.get("query") or "")[:max_query_len]
+        if len(e.get("query") or "") > max_query_len:
+            q += "…"
+        rows.append({
+            "序号": i + 1,
+            "时间": e.get("ts", "")[-8:],  # HH:MM:SS
+            "问题": q,
+            "🎯 命中数": e.get("final_count", 0),
+            "⭐ 平均相关性": f"{e['avg_score']:.2f}" if e.get("avg_score") is not None else "—",
+            "⭐ 最高相关性": f"{e['max_score']:.2f}" if e.get("max_score") is not None else "—",
+            "重排": "是" if e.get("reranker_used") else "否",
+        })
+
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    # 趋势：有 avg_score 的条目画折线图
+    scores_avail = [e for e in history if e.get("avg_score") is not None]
+    if len(scores_avail) >= 2:
+        st.caption("📉 平均相关性趋势（仅含使用重排的查询）")
+        st.line_chart({"⭐ 平均相关性": [e["avg_score"] for e in scores_avail]})
 
 
 def _extract_text_from_file(uploaded_file) -> str:
@@ -207,6 +397,99 @@ def add_sample_documents() -> None:
         st.error(f"❌ 添加失败：{e}")
 
 
+# ==================== 检索可视化 ====================
+# 颜色编码：🟢 优秀 (>0.8)  🟡 良好 (0.6-0.8)  ⚪ 一般 (<0.6)
+def _score_emoji(score: float) -> tuple:
+    """返回 (颜色 emoji, 星级字符串)。"""
+    if score >= 0.8:
+        return ("🟢", "⭐⭐⭐")  # 优秀
+    if score >= 0.6:
+        return ("🟡", "⭐⭐")   # 良好
+    return ("⚪", "⭐")         # 一般
+
+
+def _score_bar(score: float, width: int = 20) -> str:
+    """生成条形可视化：████████████████░░░░ 0.95"""
+    filled = round(min(1.0, max(0.0, score)) * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"{bar} {score:.2f}"
+
+
+def _truncate_doc(doc: str, max_len: int = 200) -> str:
+    """文档内容截断到 max_len 字，避免太长。"""
+    if not doc:
+        return ""
+    doc = doc.strip()
+    if len(doc) <= max_len:
+        return doc
+    return doc[:max_len].rstrip() + "…"
+
+
+def render_retrieval_visualization(
+    sources: list,
+    retrieved_docs: list,
+    debug: dict,
+    query: str = "",
+) -> None:
+    """
+    用 expander + metric + progress + 截断 + 复制，展示检索结果与统计。
+    query 用于在文档片段中高亮用户关键词。
+    """
+    if not sources or not retrieved_docs:
+        return
+
+    # 是否有 rerank 分数（用于统计和进度条）
+    rerank_list = (debug or {}).get("rerank") or []
+    has_scores = len(rerank_list) >= len(retrieved_docs)
+    if has_scores and rerank_list:
+        scores = [float(r.get("score") or 0) for r in rerank_list[: len(retrieved_docs)]]
+        avg_score = sum(scores) / len(scores) if scores else None
+        max_score = max(scores) if scores else None
+    else:
+        scores = [None] * len(retrieved_docs)
+        avg_score = max_score = None
+
+    with st.expander("🔍 检索详情", expanded=True):
+        # 统计数据：st.metric（emoji 增强可读性）
+        n = len(sources)
+        cols = st.columns(3)
+        cols[0].metric("🎯 命中片段数", n)
+        if avg_score is not None:
+            cols[1].metric("⭐ 平均相关性", f"{avg_score:.2f}")
+        if max_score is not None:
+            cols[2].metric("⭐ 最高相关性", f"{max_score:.2f}")
+
+        st.markdown("---")
+        st.markdown("**📄 文档引用（可复制）**")
+
+        for i, (source, doc) in enumerate(zip(sources, retrieved_docs)):
+            score = scores[i] if i < len(scores) else None
+            meta = source if isinstance(source, dict) else {}
+            src_label = meta.get("source", "未知")
+            chunk_id = meta.get("chunk_id")
+            chunk_info = f" (chunk {chunk_id})" if chunk_id is not None else ""
+
+            # 相关性：条形 + 分数 + 颜色 emoji + 星级
+            if score is not None:
+                color_emoji, stars = _score_emoji(score)
+                bar_str = _score_bar(score)
+                st.markdown(
+                    f"**📄 文档{i + 1}** {src_label}{chunk_info}  \n"
+                    f"`{bar_str}` {color_emoji} {stars}"
+                )
+                st.progress(min(1.0, max(0.0, score)))
+            else:
+                st.markdown(f"**📄 文档{i + 1}** {src_label}{chunk_info}")
+
+            # 文档截断 200 字 + 关键词高亮 + 复制（st.code 自带复制按钮）
+            snippet = _truncate_doc(doc, RETRIEVAL_SNIPPET_LEN)
+            if query:
+                st.markdown(highlight_keywords(snippet, query))
+            st.code(snippet, language=None)
+            st.caption("↑ 点击代码块右侧图标可复制")
+            st.markdown("")
+
+
 # ==================== 主界面 ====================
 def render_main_area() -> None:
     """渲染主界面。"""
@@ -235,17 +518,20 @@ def render_main_area() -> None:
 
 def render_chat_history() -> None:
     """渲染对话历史。"""
+    last_user_question = ""
     for message in st.session_state.chat_history:
         if message["role"] == "user":
+            last_user_question = message.get("content", "")
             with st.chat_message("user", avatar="👤"):
                 st.write(message["content"])
         else:
             with st.chat_message("assistant", avatar="🤖"):
+                st.markdown("**📊 答案**")
                 st.write(message["content"])
 
-        # 显示检索来源
+        # 显示检索来源（混合检索的文档片段，含关键词高亮）
         if "sources" in message and message["sources"]:
-            with st.expander("📚 查看检索来源"):
+            with st.expander("🔍 检索过程（混合检索：向量 + BM25）"):
                 for i, (source, doc) in enumerate(
                     zip(message["sources"], message["retrieved_docs"]),
                     start=1,
@@ -253,11 +539,47 @@ def render_chat_history() -> None:
                     src = source.get("source", "未知")
                     chunk_id = source.get("chunk_id")
                     chunk_info = f"(chunk {chunk_id})" if chunk_id is not None else ""
+                    snippet = _truncate_doc(doc, RETRIEVAL_SNIPPET_LEN)
+                    highlighted = highlight_keywords(snippet, last_user_question)
                     st.markdown(
-                        f"**来源 {i}: {src} {chunk_info}**\n\n"
-                        f"{doc[:200]}...",
+                        f"**来源 {i}: {src} {chunk_info}**\n\n{highlighted}",
                         unsafe_allow_html=True,
                     )
+
+        # 可视化：统计 + 相关性进度条 + 截断 + 复制（含关键词高亮）
+        if "sources" in message and message["sources"]:
+            render_retrieval_visualization(
+                message["sources"],
+                message["retrieved_docs"],
+                message.get("debug"),
+                query=last_user_question,
+            )
+
+        # 显示更详细的检索思考过程（向量 / BM25 / 融合）
+        debug = message.get("debug")
+        if debug:
+            with st.expander("🧠 思考过程明细（向量检索 / BM25 / 融合排序）"):
+                for key, label in [
+                    ("vector", "🔍 向量检索 TopK"),
+                    ("bm25", "🔍 BM25 检索 TopK"),
+                    ("fused", "🎯 RRF 融合 TopK（最终喂给大模型）"),
+                ]:
+                    items = debug.get(key) or []
+                    if not items:
+                        continue
+                    st.markdown(f"**{label}**")
+                    for idx, item in enumerate(items, start=1):
+                        meta = item.get("meta") or {}
+                        src = meta.get("source", "未知")
+                        chunk_id = meta.get("chunk_id")
+                        chunk_info = f"(chunk {chunk_id})" if chunk_id is not None else ""
+                        doc = (item.get("doc") or "")[:200]
+                        doc_hl = highlight_keywords(doc, last_user_question)
+                        st.markdown(
+                            f"- **{idx}. {src} {chunk_info}**\n\n{doc_hl}...",
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown("---")
 
 
 def render_chat_input() -> None:
@@ -282,40 +604,105 @@ def render_chat_input() -> None:
 
     # 调用 RAG 引擎获取答案
     with st.chat_message("assistant", avatar="🤖"):
-        with st.spinner("正在思考……"):
-            try:
-                result = st.session_state.rag_engine.ask(user_question)
+        use_reranker = st.session_state.get("use_reranker", False)
 
-                # 显示答案
-                st.write(result["answer"])
+        try:
+            # 如果勾选了重排模型且尚未加载，则先展示专门的加载提示
+            if use_reranker and not st.session_state.get("reranker_loaded", False):
+                with st.spinner("正在加载 Reranker 模型...(首次加载可能较慢)"):
+                    ok = st.session_state.rag_engine.ensure_reranker_loaded()
+                st.session_state.reranker_loaded = ok
 
-                # 显示检索来源
-                if result.get("sources"):
-                    with st.expander("📚 查看检索来源"):
-                        for i, (source, doc) in enumerate(
-                            zip(result["sources"], result["retrieved_docs"]),
-                            start=1,
-                        ):
-                            src = source.get("source", "未知")
-                            chunk_id = source.get("chunk_id")
-                            chunk_info = f"(chunk {chunk_id})" if chunk_id is not None else ""
-                            st.markdown(
-                                f"**来源 {i}: {src} {chunk_info}**\n\n"
-                                f"{doc[:200]}...",
-                                unsafe_allow_html=True,
-                            )
-
-                # 添加助手消息到历史
-                st.session_state.chat_history.append(
-                    {
-                        "role": "assistant",
-                        "content": result["answer"],
-                        "sources": result.get("sources", []),
-                        "retrieved_docs": result.get("retrieved_docs", []),
-                    }
+            # 正式思考阶段
+            with st.spinner("正在思考……"):
+                result = st.session_state.rag_engine.ask(
+                    user_question,
+                    use_reranker=use_reranker,
                 )
-            except Exception as e:  # noqa: BLE001
-                st.error(f"❌ 出错了：{e}")
+
+        except Exception as e:  # noqa: BLE001
+            st.error(f"❌ 出错了：{e}")
+            return
+
+        # 📊 答案
+        st.markdown("**📊 答案**")
+        st.write(result["answer"])
+
+        # 显示检索来源（混合检索的文档片段，含关键词高亮）
+        if result.get("sources"):
+            with st.expander("🔍 检索过程（混合检索：向量 + BM25）"):
+                for i, (source, doc) in enumerate(
+                    zip(result["sources"], result["retrieved_docs"]),
+                    start=1,
+                ):
+                    src = source.get("source", "未知")
+                    chunk_id = source.get("chunk_id")
+                    chunk_info = f"(chunk {chunk_id})" if chunk_id is not None else ""
+                    snippet = _truncate_doc(doc, RETRIEVAL_SNIPPET_LEN)
+                    highlighted = highlight_keywords(snippet, user_question)
+                    st.markdown(
+                        f"**来源 {i}: {src} {chunk_info}**\n\n{highlighted}",
+                        unsafe_allow_html=True,
+                    )
+
+        # 可视化：统计 + 相关性进度条 + 截断 + 复制（含关键词高亮）
+        if result.get("sources"):
+            render_retrieval_visualization(
+                result["sources"],
+                result["retrieved_docs"],
+                result.get("debug"),
+                query=user_question,
+            )
+
+        # 显示更详细的检索思考过程（向量 / BM25 / 融合）
+        debug = result.get("debug")
+        if debug:
+            with st.expander("🧠 思考过程明细（向量检索 / BM25 / 融合排序）"):
+                for key, label in [
+                    ("vector", "🔍 向量检索 TopK"),
+                    ("bm25", "🔍 BM25 检索 TopK"),
+                    ("fused", "🎯 RRF 融合 TopK（最终喂给大模型）"),
+                ]:
+                    items = debug.get(key) or []
+                    if not items:
+                        continue
+                    st.markdown(f"**{label}**")
+                    for idx, item in enumerate(items, start=1):
+                        meta = item.get("meta") or {}
+                        src = meta.get("source", "未知")
+                        chunk_id = meta.get("chunk_id")
+                        chunk_info = f"(chunk {chunk_id})" if chunk_id is not None else ""
+                        doc = (item.get("doc") or "")[:200]
+                        doc_hl = highlight_keywords(doc, user_question)
+                        st.markdown(
+                            f"- **{idx}. {src} {chunk_info}**\n\n{doc_hl}...",
+                            unsafe_allow_html=True,
+                        )
+                st.markdown("---")
+
+        # 记录本次检索质量，用于历史对比与趋势
+        _record_retrieval_quality(user_question, result, use_reranker)
+
+        # 保存最近一次检索详情，供导出报告使用
+        st.session_state.last_retrieval_for_export = {
+            "query": user_question,
+            "answer": result.get("answer", ""),
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "sources": result.get("sources", []),
+            "retrieved_docs": result.get("retrieved_docs", []),
+            "debug": result.get("debug"),
+        }
+
+        # 添加助手消息到历史
+        st.session_state.chat_history.append(
+            {
+                "role": "assistant",
+                "content": result["answer"],
+                "sources": result.get("sources", []),
+                "retrieved_docs": result.get("retrieved_docs", []),
+                "debug": result.get("debug"),
+            }
+        )
 
 
 # ==================== 主程序 ====================
