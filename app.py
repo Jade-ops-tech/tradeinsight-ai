@@ -66,19 +66,13 @@ def init_session_state() -> None:
         st.session_state.last_retrieval_for_export = None  # 最近一次检索详情，用于导出报告
 
 
-def init_rag_engine() -> bool:
-    """初始化 RAG 引擎。"""
-    if st.session_state.rag_engine is None:
+def init_rag_engine(api_key: str) -> bool:
+    """使用给定的 api_key 初始化 RAG 引擎。"""
+    if st.session_state.rag_engine is None or st.session_state.get("_last_api_key") != api_key:
         try:
-            # 动态导入（避免在没有安装依赖时报错）
             from rag_engine import RAGEngine
-
-            api_key = os.getenv("DEEPSEEK_API_KEY")
-            if not api_key:
-                st.error("⚠️ 未找到 DeepSeek API 密钥！请在 .env 文件中配置 DEEPSEEK_API_KEY")
-                return False
-
             st.session_state.rag_engine = RAGEngine(api_key=api_key)
+            st.session_state._last_api_key = api_key
             return True
         except Exception as e:  # noqa: BLE001
             st.error(f"❌ RAG 引擎初始化失败：{e}")
@@ -90,6 +84,22 @@ def init_rag_engine() -> bool:
 def render_sidebar() -> None:
     """渲染侧边栏。"""
     with st.sidebar:
+        # API Key 输入（优先使用输入框，其次 .env）
+        st.subheader("🔑 API Key")
+        api_key_input = st.text_input(
+            "DeepSeek API Key",
+            type="password",
+            key="api_key_input",
+            placeholder="",
+            help="在 https://platform.deepseek.com 获取",
+        )
+        effective_api_key = (api_key_input or "").strip() or os.getenv("DEEPSEEK_API_KEY")
+        if not effective_api_key:
+            st.warning("⚠️ 请在侧边栏输入你的 DeepSeek API Key")
+            st.stop()
+        st.session_state.effective_api_key = effective_api_key
+
+        st.divider()
         st.title("📚 知识库管理")
 
         # 显示知识库状态
@@ -708,15 +718,17 @@ def render_chat_input() -> None:
 # ==================== 主程序 ====================
 def main() -> None:
     """主程序入口。"""
-    # 初始化
     init_session_state()
 
-    # 初始化 RAG 引擎
-    if not init_rag_engine():
+    # 先渲染侧边栏（含 API Key 输入），得到 effective_api_key 后初始化引擎
+    render_sidebar()
+    api_key = st.session_state.get("effective_api_key") or os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        st.warning("⚠️ 请在侧边栏输入你的 DeepSeek API Key")
+        st.stop()
+    if not init_rag_engine(api_key):
         st.stop()
 
-    # 渲染界面
-    render_sidebar()
     render_main_area()
 
 
